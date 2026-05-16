@@ -44,7 +44,21 @@ jobs:
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           DATABASE_URL: postgresql+asyncpg://ai_news_user:ai_news_pass@localhost:5432/ai_news_db
           REDIS_URL: redis://localhost:6379/0
-        run: python -m bot.main --run-once
+        run: |
+          python -c "
+          import asyncio, sys
+          sys.path.insert(0, '.')
+          from db.session import get_engine
+          from db.models import Base
+          async def init_db():
+              engine = get_engine()
+              async with engine.begin() as conn:
+                  await conn.run_sync(Base.metadata.create_all)
+              await engine.dispose()
+              print('DB schema created')
+          asyncio.run(init_db())
+          "
+          python -m bot.main --run-once
       - name: Commit updates
         run: |
           git config user.name "GitHub Actions Bot"

@@ -2,6 +2,7 @@
 AI News Daily - Stage 2: Synthesis (single LLM call).
 """
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,18 @@ from settings import Settings
 log = logging.getLogger(__name__)
 
 PROMPT_PATH = Path("prompts/analyst.md")
+
+
+def _fix_llm_html(text: str) -> str:
+    """Fix common LLM-generated HTML malformations before Telegram delivery."""
+    # Convert <a href="URL">Title</a> → Title (URL)
+    text = re.sub(r'<a href="([^"]+)">([^<]+)</a>', r'\2 (\1)', text)
+    # Remove broken/unclosed <a> tags
+    text = re.sub(r'<a[^>]*>', '[', text)
+    text = re.sub(r'</a>', ']', text)
+    # Escape bare & not already HTML entities
+    text = re.sub(r'&(?![a-zA-Z]{2,6};|#[0-9]+;)', '&', text)
+    return text
 
 
 def load_system_prompt() -> str:
@@ -60,7 +73,7 @@ def synthesize(settings: Settings, stories: list[dict[str, Any]]) -> str:
             )
             brief = response.choices[0].message.content
             log.info(f"  → LLM response received ({len(brief)} chars)")
-            return brief
+            return _fix_llm_html(brief)
         except Exception as e:
             log.warning(f"  → LLM attempt {attempt}/{settings.MAX_RETRIES} failed: {e}")
             if attempt < settings.MAX_RETRIES:
