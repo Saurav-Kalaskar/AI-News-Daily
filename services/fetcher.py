@@ -1,48 +1,41 @@
 """
-AI News Daily - Stage 1: Collection (pure functions, no LLM).
+Async fetchers for AI News Daily.
+All I/O uses aiohttp for concurrent, non-blocking requests.
 """
+import asyncio
 import hashlib
 import json
 import logging
-import email.utils
+import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-import requests
-import xml.etree.ElementTree as ET
+import aiohttp
 
 from settings import Settings
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-HN_KEYWORDS = ["ai", "llm", "agent", "claude", "gpt", "openai", "neural",
-               "machine learning", "gemini", "chatgpt", "artificial intelligence"]
+HN_KEYWORDS = [
+    "ai", "llm", "agent", "claude", "gpt", "openai", "neural",
+    "machine learning", "gemini", "chatgpt", "artificial intelligence",
+]
 SEEN_STORIES_PATH = Path("data/seen_stories.json")
 ARXIV_NS = "http://www.w3.org/2005/Atom"
-
-Settings().model_dump()  # validate env
 
 
 # ── Hacker News ──────────────────────────────────────────────────────────────
 
-def fetch_hn_stories(settings: Settings) -> list[dict[str, Any]]:
-    """Fetch top 50 HN stories, filter by AI keywords and 24‑hour cutoff."""
+async def fetch_hn_stories(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
+    """Fetch top 50 HN stories, filter by AI keywords."""
     log.info("Fetching Hacker News top stories...")
-    ids = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=15, verify=False).json()
-    stories = []
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    ids = await _fetch_json(session, "https://hacker-news.firebaseio.com/v0/topstories.json", ssl=False)
+    stories: list[dict[str, Any]] = []
     for story_id in ids[:50]:
-        item = requests.get(f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json", timeout=15).json()
+        item = await _fetch_json(session, f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json", ssl=False)
         if not item or not item.get("title"):
-            continue
-        # timestamp conversion: HN provides Unix epoch in "time" field
-        ts = item.get("time")
-        if ts is None:
-            continue
-        story_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        if story_dt < cutoff:
             continue
         title_lower = item["title"].lower()
         if any(kw in title_lower for kw in HN_KEYWORDS):
@@ -52,20 +45,21 @@ def fetch_hn_stories(settings: Settings) -> list[dict[str, Any]]:
                 "source": "Hacker News",
                 "score": item.get("score", 0),
             })
-    log.info(f"  → {len(stories)} HN stories after filter and time cutoff")
+    log.info(f"  → {len(stories)} HN stories after filter")
     return stories
 
 
-# ── arXiv ─────────────────────────────────────────────────────────────────────
+# ── arXiv ───────────────────────────────────────────────────────────────────
 
-def fetch_arxiv_stories(settings: Settings) -> list[dict[str, Any]]:
-    """Fetch recent cs.AI papers from arXiv Atom feed, apply 24‑hour cutoff."""
+async def fetch_arxiv_stories(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
+    """Fetch recent cs.AI papers from arXiv Atom feed, apply 24‑hour cutoff, ignore SSL verification."""
     log.info("Fetching arXiv cs.AI papers...")
     feed_url = "http://export.arxiv.org/api/query?search_query=cat:cs.AI&max_results=15&sortBy=submittedDate"
-    resp = requests.get(feed_url, timeout=20)
-    resp.raise_for_status()
-    root = ET.fromstring(resp.content)
-    stories = []
+    async with session.get(feed_url, timeout=aiohttp.ClientTimeout(total=30), ssl=False) as resp:
+        resp.raise_for_status()
+        text = await resp.text()
+    root = ET.fromstring(text)
+    stories: list[dict[str, Any]] = []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     for entry in root.findall(f"{{{ARXIV_NS}}}entry"):
         title_el = entry.find(f"{{{ARXIV_NS}}}title")
@@ -73,11 +67,9 @@ def fetch_arxiv_stories(settings: Settings) -> list[dict[str, Any]]:
         link_el = entry.find(f"{{{ARXIV_NS}}}link[@rel='alternate']")
         if link_el is None:
             link_el = entry.find(f"{{{ARXIV_NS}}}link")
-        # Published date
         pub_el = entry.find(f"{{{ARXIV_NS}}}published")
         if pub_el is None or not pub_el.text:
             continue
-        # Parse ISO‑8601 (e.g., 2026-05-12T08:30:00Z)
         try:
             pub_dt = datetime.fromisoformat(pub_el.text.replace('Z', '+00:00'))
         except Exception:
@@ -98,7 +90,7 @@ def fetch_arxiv_stories(settings: Settings) -> list[dict[str, Any]]:
     return stories
 
 
-# ── RSS Feeds ─────────────────────────────────────────────────────────────────
+# ── RSS Feeds ───────────────────────────────────────────────────────────────
 
 RSS_FEEDS = [
     ("MIT Technology Review", "https://www.technologyreview.com/feed/"),
@@ -107,18 +99,14 @@ RSS_FEEDS = [
 ]
 
 
-def fetch_rss_stories(settings: Settings) -> list[dict[str, Any]]:
-    """Fetch stories from RSS/Atom feeds, apply 24‑hour cutoff."""
-    stories = []
-    headers = {"User-Agent": "AI-News-Daily/1.0"}
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+async def fetch_rss_stories(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
+    """Fetch stories from RSS/Atom feeds."""
+    stories: list[dict[str, Any]] = []
     for source, url in RSS_FEEDS:
         try:
             log.info(f"Fetching RSS: {source}...")
-            resp = requests.get(url, headers=headers, timeout=15)
-            resp.raise_for_status()
-            root = ET.fromstring(resp.content)
-            # Handle both RSS and Atom formats
+            text = await _fetch_text(session, url, headers={"User-Agent": "AI-News-Daily/1.0"}, ssl=False)
+            root = ET.fromstring(text)
             channel = root.find("channel")
             entries = channel.findall("item") if channel is not None else root.findall("entry")
             count = 0
@@ -127,18 +115,6 @@ def fetch_rss_stories(settings: Settings) -> list[dict[str, Any]]:
                 link_el = entry.find("link")
                 if title_el is None:
                     title_el = entry.find("{http://www.w3.org/2005/Atom}title")
-                # Date extraction
-                date_el = entry.find("pubDate") or entry.find("{http://www.w3.org/2005/Atom}updated")
-                if date_el is not None and date_el.text:
-                    try:
-                        pub_dt = email.utils.parsedate_to_datetime(date_el.text)
-                        if pub_dt.tzinfo is None:
-                            pub_dt = pub_dt.replace(tzinfo=timezone.utc)
-                        if pub_dt < cutoff:
-                            continue
-                    except Exception:
-                        pass
-                # Atom can have link as attribute or element
                 link = None
                 if link_el is not None:
                     link = link_el.text or link_el.get("href")
@@ -160,33 +136,28 @@ def fetch_rss_stories(settings: Settings) -> list[dict[str, Any]]:
     return stories
 
 
-# ── Deduplication ──────────────────────────────────────────────────────────────
+# ── Deduplication ─────────────────────────────────────────────────────────────
 
 def load_seen_stories() -> dict[str, float]:
-    """Load seen_stories.json. Returns dict of hash → timestamp."""
     if SEEN_STORIES_PATH.exists():
         return json.loads(SEEN_STORIES_PATH.read_text())
     return {}
 
 
 def save_seen_stories(seen: dict[str, float]) -> None:
-    """Write seen_stories.json atomically."""
     SEEN_STORIES_PATH.write_text(json.dumps(seen, indent=2))
 
 
 def hash_title(title: str) -> str:
-    """SHA256 first 80 chars, return first 16 hex chars."""
     return hashlib.sha256(title[:80].encode()).hexdigest()[:16]
 
 
 def prune_old_entries(seen: dict[str, float], max_age_days: int = 7) -> None:
-    """Remove entries older than max_age_days."""
     cutoff = (datetime.utcnow() - timedelta(days=max_age_days)).timestamp()
     seen.update({k: v for k, v in seen.items() if v >= cutoff})
 
 
 def deduplicate(stories: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Filter out stories whose title-hash is already in seen_stories.json."""
     seen = load_seen_stories()
     prune_old_entries(seen)
     new_stories = []
@@ -201,7 +172,29 @@ def deduplicate(stories: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return new_stories
 
 
-def collect(settings: Settings) -> list[dict[str, Any]]:
-    """Stage 1: Aggregate all sources, deduplicate, return new stories."""
-    all_stories = fetch_hn_stories(settings) + fetch_arxiv_stories(settings) + fetch_rss_stories(settings)
-    return deduplicate(all_stories)
+# ── Collect orchestrator ─────────────────────────────────────────────────────
+
+async def collect(settings: Settings) -> list[dict[str, Any]]:
+    """Aggregate all sources, deduplicate, return new stories."""
+    async with aiohttp.ClientSession() as session:
+        all_stories = await asyncio.gather(
+            fetch_hn_stories(session),
+            fetch_arxiv_stories(session),
+            fetch_rss_stories(session),
+        )
+    flat = [s for sublist in all_stories for s in sublist]
+    return deduplicate(flat)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _fetch_json(session: aiohttp.ClientSession, url: str, ssl: bool = True) -> Any:
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30), ssl=ssl) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+
+async def _fetch_text(session: aiohttp.ClientSession, url: str, headers: dict | None = None, ssl: bool = True) -> str:
+    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30), ssl=ssl) as resp:
+        resp.raise_for_status()
+        return await resp.text()

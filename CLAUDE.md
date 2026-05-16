@@ -1,64 +1,72 @@
-# CLAUDE.md This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+# AI News Daily — Architectural Conventions
 
-## Project Overview
+## 1. Async-First
+- All I/O-bound code runs under `asyncio`.
+- Use `aiohttp` for HTTP requests, `asyncpg` / SQLAlchemy async for database, `aioredis` for Redis.
+- No synchronous blocking calls in the main event loop.
 
-Automated AI news briefing bot. 3-stage pipeline: collect → synthesize → deliver. Runs as single Python process, deployed via GitHub Actions cron.
+## 2. aiogram 3.x
+- Bot entry point: `bot/main.py` using `aiogram.Bot` + `Dispatcher`.
+- Handlers live in `bot/handlers/` and use aiogram FSM (`aiogram.fsm`).
+- FSM state storage backed by Redis (`RedisStorage`).
+- Telegram API calls go through aiogram; never raw `requests.post`.
 
-## Commands
+## 3. SQLAlchemy 2.0 + Async PostgreSQL
+- Engine created with `create_async_engine("postgresql+asyncpg://...")`.
+- Models use `declarative_base()` with type-annotated columns (`Mapped[int]`, etc.).
+- Sessions via `async_sessionmaker` with `expire_on_commit=False`.
+- All DB access through async context managers (`async with session.begin()`).
 
-```bash
-# Install dependencies
-pip install -r requirements.txt
+## 4. Redis
+- Used for FSM state persistence and short-term caching (e.g., dedup hashes, rate limits).
+- Connection pool initialized once at startup, injected into services.
+- Keys namespaced: `ai_news:<entity>:<id>`.
 
-# Run full pipeline locally
-python main.py
+## 5. MarkdownV2 Sanitization
+- All text sent to Telegram MUST pass through the strict sanitizer (`services/sanitize.py`).
+- Escape EVERY character in the Telegram MarkdownV2 reserved set: `_ * [ ] ( ) ~ ` > # + - = | { } . !`
+- No raw strings reaching `bot.send_message`.
+- Use `aiogram`'s built-in markdown helpers when possible; supplement with custom sanitizer for dynamic content.
 
-# Trigger GitHub Actions workflow manually
-# Actions tab → "Daily AI News Brief" → Run workflow
+## 6. Single-Responsibility Principle
+- One function = one job.
+- A function either fetches data, transforms data, persists data, or dispatches a message—never two.
+- Services (`services/`) are stateless and receive dependencies via arguments.
+
+## 7. Project Layout
+
+```
+├── bot/
+│   ├── main.py               # aiogram Dispatcher + startup/shutdown
+│   └── handlers/
+│       └── ...               # FSM-based command handlers
+├── db/
+│   ├── models.py             # SQLAlchemy 2.0 models
+│   └── session.py            # Async engine + sessionmaker
+├── services/
+│   ├── collect.py            # Async fetchers (aiohttp)
+│   ├── synthesize.py         # Async LLM call
+│   ├── deliver.py            # Async Telegram delivery (aiogram)
+│   ├── sanitize.py           # MarkdownV2 strict sanitizer
+│   ├── cache.py              # Redis wrapper
+│   └── fsm.py                # FSM state definitions
+├── settings.py               # Pydantic BaseSettings
+├── .env                      # Secrets (not committed)
+├── docker-compose.yml        # PostgreSQL + Redis
+└── requirements.txt
 ```
 
-No test suite, linter, or Makefile exists.
+## 8. Environment Variables
+- `DATABASE_URL` — PostgreSQL connection string (asyncpg)
+- `REDIS_URL` — Redis connection string
+- `TELEGRAM_BOT_TOKEN` — Bot token
+- `TELEGRAM_CHANNEL_ID` — Target channel (with `-100` prefix)
+- `LLM_API_KEY`, `LLM_BASE_URL`, `MODEL_NAME` — LLM config
 
-## Architecture
+## 9. CI/CD
+- GitHub Actions runs `python -m bot.main` on schedule.
+- Ensure `DATABASE_URL` and `REDIS_URL` are injected as secrets.
 
-**Pipeline:** `main.py` orchestrates three stages sequentially.
-
-| Stage | File | Responsibility |
-|-------|------|----------------|
-| 1. Collect | `collect.py` | Fetch HN (Firebase API), arXiv, RSS feeds. Keyword-filter HN. Deduplicate via SHA-256 title hashes in `data/seen_stories.json`. Prune entries >7 days. |
-| 2. Synthesize | `synthesize.py` | Load system prompt from `prompts/analyst.md`. Build user prompt from stories. Call NVIDIA LLM via `openai` client (custom `base_url`). Exponential backoff retry. |
-| 3. Deliver | `deliver.py` | Sanitize markdown for Telegram (whitelist chars, escape brackets). Send via Bot API. Archive brief to `data/briefs/brief_<timestamp>.md` with YAML front-matter. |
-
-**Config:** `settings.py` — pydantic-settings `BaseSettings` reads `.env`. All modules import `Settings`.
-
-**Data flow:**
-```
-HN/arXiv/RSS → collect() → dedup (seen_stories.json) → stories list
-  → synthesize() via LLM (system + user prompt) → markdown brief
-  → deliver() → Telegram API + archive (data/briefs/*.md)
-```
-
-## Key Patterns
-
-- **Dedup:** SHA-256 of title prefix → stored in `data/seen_stories.json`. 7-day TTL auto-prune.
-- **Retry:** Exponential backoff (`2^attempt` seconds) on LLM and Telegram calls.
-- **Telegram sanitization:** `sanitize_markdown` strips unsupported chars, escapes brackets. Telegram `parse_mode=Markdown` is strict.
-- **State persistence:** GitHub Actions commits `seen_stories.json` + new briefs back to repo. No external DB.
-- **Pydantic Settings:** All config via `.env` + `Settings` class. Secrets: `LLM_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHANNEL_ID`. Optional: `LLM_BASE_URL`, `MODEL_NAME`, `MAX_RETRIES`.
-
-## Deployment
-
-GitHub Actions workflow (`.github/workflows/daily_brief.yml`):
-- Cron: `0 9,21 * * *` UTC (twice daily) + manual `workflow_dispatch`
-- Runs on `ubuntu-latest`, Python 3.12
-- Injects secrets as env vars
-- Commits state changes (seen_stories + briefs) back to repo
-
-## LLM Integration
-
-Uses NVIDIA-hosted LLM (`meta/llama-3.1-70b-instruct` by default) via OpenAI-compatible client. `synthesize.py` sets `base_url` to NVIDIA's integrate API. Single completion call per run.
-
-## Requirements
-
-- Python 3.10+
-- `pydantic-settings>=2.0.0`, `openai>=1.0.0`, `requests>=2.31.0`, `pyyaml>=6.0`
+## 10. Error Handling
+- All async operations wrapped in try/except with exponential backoff where appropriate.
+- Log structured errors; never leak tokens or secrets in logs.

@@ -1,13 +1,14 @@
 """
-AI News Daily - Stage 2: Synthesis (single LLM call).
+Async LLM synthesis service.
+Single call with exponential back-off.
 """
+import asyncio
 import logging
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from settings import Settings
 
@@ -16,40 +17,36 @@ log = logging.getLogger(__name__)
 PROMPT_PATH = Path("prompts/analyst.md")
 
 
-def load_system_prompt() -> str:
+def _load_system_prompt() -> str:
     return PROMPT_PATH.read_text()
 
 
-def build_user_prompt(stories: list[dict[str, Any]]) -> str:
-    """Format stories into a plain-text digest for the LLM."""
+def _build_user_prompt(stories: list[dict[str, Any]]) -> str:
     lines = []
     for i, s in enumerate(stories, 1):
         lines.append(f"[{i}] {s['source']}: {s['title']}\n  URL: {s['url']}")
     return "\n\n".join(lines)
 
 
-def synthesize(settings: Settings, stories: list[dict[str, Any]]) -> str:
-    """
-    Stage 2: Send aggregated news to LLM, return markdown briefing.
-    Retries up to MAX_RETRIES on transient failures.
-    """
+async def synthesize(settings: Settings, stories: list[dict[str, Any]]) -> str:
+    """Send aggregated news to LLM, return markdown briefing."""
     if not stories:
         raise ValueError("No stories to synthesize")
 
     log.info(f"Synthesizing {len(stories)} stories via LLM...")
 
-    client = OpenAI(
+    client = AsyncOpenAI(
         base_url=settings.LLM_BASE_URL,
         api_key=settings.LLM_API_KEY,
     )
 
-    system_prompt = load_system_prompt()
-    user_prompt = build_user_prompt(stories)
+    system_prompt = _load_system_prompt()
+    user_prompt = _build_user_prompt(stories)
     utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     for attempt in range(1, settings.MAX_RETRIES + 1):
         try:
-            response = client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=settings.MODEL_NAME,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -64,6 +61,6 @@ def synthesize(settings: Settings, stories: list[dict[str, Any]]) -> str:
         except Exception as e:
             log.warning(f"  → LLM attempt {attempt}/{settings.MAX_RETRIES} failed: {e}")
             if attempt < settings.MAX_RETRIES:
-                time.sleep(2 ** attempt)
+                await asyncio.sleep(2 ** attempt)
             else:
                 raise RuntimeError(f"All {settings.MAX_RETRIES} LLM attempts failed") from e

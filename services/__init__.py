@@ -1,7 +1,6 @@
-"""
-AI News Daily - Stage 3: Delivery (Telegram + archiving).
-"""
+"""AI News Daily - Stage 3: Delivery (Telegram + archiving)."""
 import logging
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -15,15 +14,34 @@ log = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 BRIEFS_DIR = Path("data/briefs")
+ALLOWED_CHARS = set("*_`[]()~`>#+-=|{}.!")
+
+
+def sanitize_markdown(text: str) -> str:
+    """
+    Escape special chars that break Telegram parse_mode=Markdown.
+    Keep all normal letters, numbers, newlines."""
+    # Escape unpaired special chars
+    text = re.sub(r'(?<!\*)\*(?!\*)', r'\\*', text)
+    text = re.sub(r'(?<!_)_(?!_)', r'\\_', text)
+    text = re.sub(r'(?<!`)`(?!`)', r'\\`', text)
+    # Escape [ and ] when not part of a markdown link [text](url)
+    text = re.sub(r'\[(?![^\]]+\])', r'\\[', text)
+    text = re.sub(r'(?<!\])\]', r'\\]', text)
+    # Escape other Telegram MarkdownV2 special chars
+    for ch in ('(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}'):
+        text = text.replace(ch, f'\\{ch}')
+    return text
 
 
 def send_telegram(settings: Settings, brief: str) -> bool:
-    """Send HTML brief to Telegram channel. Returns True on success."""
+    """Send markdown brief to Telegram channel. Returns True on success."""
     log.info("Sending brief to Telegram...")
+    sanitized = sanitize_markdown(brief)
     payload = {
         "chat_id": settings.TELEGRAM_CHANNEL_ID,
-        "text": brief,
-        "parse_mode": "HTML",
+        "text": sanitized,
+        "parse_mode": "Markdown",
     }
     url = TELEGRAM_API.format(token=settings.TELEGRAM_BOT_TOKEN)
     for attempt in range(1, settings.MAX_RETRIES + 1):
@@ -44,9 +62,7 @@ def send_telegram(settings: Settings, brief: str) -> bool:
 
 
 def archive_brief(brief: str, stories: list[dict]) -> Path:
-    """
-    Save brief to data/briefs/brief_{timestamp}.md with YAML frontmatter.
-    """
+    """Save brief to data/briefs/brief_{timestamp}.md with YAML frontmatter."""
     BRIEFS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S")
     frontmatter = {

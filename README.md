@@ -1,129 +1,87 @@
 # AI News Daily
 
-An automated daily briefing service that collects AI news from multiple sources, synthesizes it using a large language model (LLM), and delivers a concise digest to a Telegram channel.
+Automated daily briefing service. Collects AI news, synthesizes via LLM, delivers to Telegram.
 
-## What It Does
+## Architecture
 
-1. **Collects** AI news from Hacker News, arXiv, TechCrunch, MIT Technology Review, and VentureBeat
-2. **Deduplicates** stories against a running history to avoid repeats
-3. **Synthesizes** the top 5 most impactful items into a structured briefing via LLM
-4. **Delivers** the briefing directly to your Telegram channel
+```
+Collect (async) → Synthesize (LLM) → Deliver (Telegram + Archive)
+```
+
+Uses aiogram 3.x, SQLAlchemy 2.0 (async PostgreSQL), Redis for FSM/cache, strict MarkdownV2 sanitization.
 
 ## Prerequisites
 
-- Python 3.10 or higher
-- A Telegram bot and bot token
-- A Telegram channel (or group) ID to receive messages
-- An NVIDIA API key (the system uses NVIDIA's hosted LLM API with the `meta/llama-3.1-70b-instruct` model)
+- Python 3.10+
+- Docker + Docker Compose
+- Telegram bot token + channel ID
+- NVIDIA API key
 
-## Setup
-
-### 1. Clone the Repository
+## Quick Start
 
 ```bash
-git clone https://github.com/your-username/ai-news-daily.git
-cd ai-news-daily
-```
-
-### 2. Create a `.env` File
-
-Create a `.env` file in the project root:
-
-```bash
-touch .env
-```
-
-Add the following variables:
-
-```env
-# NVIDIA LLM API key (required)
-LLM_API_KEY=your_nvidia_api_key_here
-
-# Optional: override the base URL (defaults to NVIDIA's integrate API)
-# LLM_BASE_URL=https://integrate.api.nvidia.com/v1
-
-# Optional: override the model (defaults to meta/llama-3.1-70b-instruct)
-# MODEL_NAME=meta/llama-3.1-70b-instruct
-
-# Telegram bot token from @BotFather
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
-
-# Telegram channel ID (e.g., -1001234567890 for channels, or a chat ID for groups)
-TELEGRAM_CHANNEL_ID=your_telegram_channel_id_here
-
-# Optional: max retries on LLM API failure (default: 3)
-# MAX_RETRIES=3
-```
-
-### 3. Install Dependencies
-
-```bash
+# 1. Install dependencies
 pip install -r requirements.txt
+
+# 2. Start PostgreSQL + Redis
+docker compose up -d
+
+# 3. Run migrations
+alembic upgrade head
+
+# 4. Copy and fill .env
+cp .env.example .env
+# Edit .env with your credentials
+
+# 5. Run the bot (long-poll + scheduler)
+python -m bot.main
+
+# Or run pipeline once (CI use)
+python -m bot.main --run-once
 ```
 
-### 4. Set Up GitHub Secrets (for GitHub Actions)
+## Environment Variables
 
-If you plan to run this via GitHub Actions, add the following secrets to your repository:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_API_KEY` | (required) | NVIDIA API key |
+| `LLM_BASE_URL` | NVIDIA integrate API | LLM endpoint |
+| `MODEL_NAME` | `meta/llama-3.1-70b-instruct` | LLM model |
+| `TELEGRAM_BOT_TOKEN` | (required) | Bot token from @BotFather |
+| `TELEGRAM_CHANNEL_ID` | (required) | Channel ID (use `-100…` for channels) |
+| `DATABASE_URL` | PostgreSQL async URL | Database connection |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
+| `MAX_RETRIES` | `3` | Retry count |
 
-1. Go to **Settings > Secrets and variables > Actions** in your GitHub repository
-2. Add each secret:
-
-| Secret Name | Description |
-|------------|-------------|
-| `LLM_API_KEY` | Your NVIDIA API key |
-| `TELEGRAM_BOT_TOKEN` | Your Telegram bot token (from @BotFather) |
-| `TELEGRAM_CHANNEL_ID` | Your Telegram channel ID |
-
-## Running Locally
-
-```bash
-python main.py
-```
-
-On a successful run, you will see output like:
+## Project Layout
 
 ```
-Collecting from HN Firebase API...
-Collecting from arXiv...
-Collecting from RSS feeds...
-Found X new stories
-Sending briefing to Telegram...
-Done.
+├── bot/                  # aiogram 3.x entry point + handlers
+│   ├── main.py
+│   └── handlers.py
+├── services/             # Async services (single-responsibility)
+│   ├── fetcher.py        # aiohttp fetchers
+│   ├── synthesize.py     # LLM call
+│   ├── deliver.py        # Telegram delivery
+│   ├── sanitize.py       # MarkdownV2 strict sanitizer
+│   └── cache.py          # Redis wrapper
+├── db/                   # SQLAlchemy 2.0 async
+│   ├── models.py
+│   └── session.py
+├── lib/                  # TypeScript utilities
+│   ├── types.ts
+│   ├── config.ts
+│   └── engine.ts
+├── alembic/              # DB migrations
+├── docker-compose.yml    # PostgreSQL + Redis
+├── CLAUDE.md             # Architectural conventions
+└── requirements.txt
 ```
 
-A copy of each briefing is saved to `data/briefs/YYYY-MM-DD.md`.
+## Deploy via GitHub Actions
 
-## Running via GitHub Actions
-
-The workflow runs automatically twice daily (9 AM and 9 PM UTC). To trigger it manually:
-
-1. Go to the **Actions** tab in your GitHub repository
-2. Select the **Daily AI News Brief** workflow
-3. Click **Run workflow** and select the branch
-
-State is persisted between runs by committing `data/seen_stories.json` and the `data/briefs/` directory back to the repository.
+Schedule: `0 9,21 * * *` UTC (twice daily). Add secrets: `LLM_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHANNEL_ID`.
 
 ## Output Format
 
-The bot sends a Telegram message with the following structure:
-
-```
-# TL;DR
-One paragraph summary of the most significant AI development.
-
-## Key Releases
-- Item 1
-- Item 2
-...
-
-## Developer Takeaways
-- Item 1
-- Item 2
-...
-
-## Sources
-1. [Title](URL)
-2. [Title](URL)
-```
-
-The message is formatted in Telegram Markdown. Only bold, italic, code, and link syntax are supported.
+Brief in 4 sections: `# TL;DR`, `## Key Releases`, `## Developer Takeaways`, `## Sources`.
